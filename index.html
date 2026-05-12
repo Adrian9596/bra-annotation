@@ -215,6 +215,10 @@
   }
   body.space-pan canvas{ cursor:grab; }
   body.grabbing canvas{ cursor:grabbing !important; }
+  .board-card.drag-over{
+    outline:3px dashed var(--select);
+    outline-offset:-3px;
+  }
 
   .segmented-control{
     display:flex;
@@ -358,6 +362,9 @@
   const IMAGE_PADDING = 48;
   const ZOOM_SENSITIVITY = 0.0018;
   const PRECISE_ZOOM_SENSITIVITY = 0.00105;
+  const AUTO_SAVE_KEY = 'bra-annotation-autosave';
+
+  let autoSaveTimer = null;
 
   const el = {
     canvas: document.getElementById('boardCanvas'),
@@ -418,10 +425,11 @@
     },
   };
 
-  function init() {
+  async function init() {
     bindUI();
     resizeCanvas();
-    seedHistory();
+    const restored = await loadAutoSave();
+    if (!restored) seedHistory();
     updateUI();
     render();
   }
@@ -458,6 +466,11 @@
     window.addEventListener('mouseup', onMouseUp);
     el.canvas.addEventListener('wheel', onWheel, { passive: false });
     el.canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    el.canvas.addEventListener('dragover', onDragOver);
+    el.canvas.addEventListener('dragenter', onDragEnter);
+    el.canvas.addEventListener('dragleave', onDragLeave);
+    el.canvas.addEventListener('drop', (e) => void onDrop(e));
 
     document.addEventListener('paste', onPasteEvent);
     document.addEventListener('keydown', onKeyDown);
@@ -644,6 +657,7 @@ function resizeCanvas() {
       state.history.past.shift();
     }
     state.history.future = [];
+    scheduleAutoSave();
     updateUI();
   }
 
@@ -1558,7 +1572,7 @@ async function importJson() {
   });
 }
 
-async function applyImportedData(data) {
+async function applyImportedData(data, { silent = false } = {}) {
   if (!data || typeof data !== 'object' || Array.isArray(data)) {
     throw new Error('JSON must be an object.');
   }
@@ -1630,10 +1644,120 @@ async function applyImportedData(data) {
 
   const annCount = validAnnotations.length;
   const imgCount = images.length;
-  let msg = 'Imported: ' + imgCount + ' image' + (imgCount !== 1 ? 's' : '') + ', ' + annCount + ' annotation' + (annCount !== 1 ? 's' : '') + '.';
-  if (skippedAnnotations > 0) msg += ' (' + skippedAnnotations + ' invalid annotation' + (skippedAnnotations !== 1 ? 's' : '') + ' skipped)';
-  if (skippedImages > 0) msg += ' (' + skippedImages + ' invalid image' + (skippedImages !== 1 ? 's' : '') + ' skipped)';
-  showToast(msg, 3400);
+  if (!silent) {
+    let msg = 'Imported: ' + imgCount + ' image' + (imgCount !== 1 ? 's' : '') + ', ' + annCount + ' annotation' + (annCount !== 1 ? 's' : '') + '.';
+    if (skippedAnnotations > 0) msg += ' (' + skippedAnnotations + ' invalid annotation' + (skippedAnnotations !== 1 ? 's' : '') + ' skipped)';
+    if (skippedImages > 0) msg += ' (' + skippedImages + ' invalid image' + (skippedImages !== 1 ? 's' : '') + ' skipped)';
+    showToast(msg, 3400);
+  }
+}
+
+function scheduleAutoSave() {
+  clearTimeout(autoSaveTimer);
+  autoSaveTimer = setTimeout(performAutoSave, 800);
+}
+
+function performAutoSave() {
+  try {
+    const data = {
+      version: 1,
+      annotations: clone(state.annotations),
+      images: state.images.map(img => ({
+        id: img.id,
+        dataURL: img.dataURL,
+        x: img.x,
+        y: img.y,
+        width: img.width,
+        height: img.height,
+      })),
+      viewport: { zoom: state.zoom, panX: state.panX, panY: state.panY },
+      nextSequence: state.nextSequence,
+      idCounter: state.idCounter,
+      savedAt: Date.now(),
+    };
+    localStorage.setItem(AUTO_SAVE_KEY, JSON.stringify(data));
+  } catch {
+    // localStorage full or unavailable — skip silently
+  }
+}
+
+async function loadAutoSave() {
+  try {
+    const raw = localStorage.getItem(AUTO_SAVE_KEY);
+    if (!raw) return false;
+    const data = JSON.parse(raw);
+    if (!data || data.version !== 1) return false;
+    const hasContent = (data.annotations?.length > 0) || (data.images?.length > 0);
+    if (!hasContent) return false;
+    seedHistory();
+    await applyImportedData(data, { silent: true });
+    const annCount = state.annotations.length;
+    const imgCount = state.images.length;
+    showToast('Session restored: ' + imgCount + ' image' + (imgCount !== 1 ? 's' : '') + ', ' + annCount + ' annotation' + (annCount !== 1 ? 's' : '') + '.', 3000);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function onDragOver(e) {
+  const items = Array.from(e.dataTransfer?.items || []);
+  const valid = items.some(item => item.kind === 'file' && (
+    item.type === 'application/json' ||
+    item.type === '' ||
+    item.type.startsWith('image/')
+  ));
+  if (valid) {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  }
+}
+
+function onDragEnter(e) {
+  const items = Array.from(e.dataTransfer?.items || []);
+  const valid = items.some(item => item.kind === 'file');
+  if (valid) {
+    e.preventDefault();
+    el.boardCard.classList.add('drag-over');
+  }
+}
+
+function onDragLeave(e) {
+  if (!el.boardCard.contains(e.relatedTarget)) {
+    el.boardCard.classList.remove('drag-over');
+  }
+}
+
+async function onDrop(e) {
+  e.preventDefault();
+  el.boardCard.classList.remove('drag-over');
+
+  const files = Array.from(e.dataTransfer?.files || []);
+  if (!files.length) return;
+
+  const jsonFile = files.find(f => f.name.endsWith('.json') || f.type === 'application/json');
+  if (jsonFile) {
+    let data;
+    try {
+      data = JSON.parse(await jsonFile.text());
+    } catch {
+      showToast('Import failed: file is not valid JSON.', 4200);
+      return;
+    }
+    try {
+      await applyImportedData(data);
+    } catch (err) {
+      showToast('Import failed: ' + (err?.message || 'unexpected error.'), 4200);
+    }
+    return;
+  }
+
+  const imageFiles = files.filter(f => f.type.startsWith('image/'));
+  if (imageFiles.length) {
+    const dataURLs = [];
+    for (const file of imageFiles) dataURLs.push(await blobToDataURL(file));
+    await addImagesFromDataURLs(dataURLs);
+  }
 }
 
 function makeJsonExportFileName() {
